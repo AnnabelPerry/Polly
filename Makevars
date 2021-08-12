@@ -1,6 +1,0 @@
-HTS_CFLAGS = -I/sw/eb/sw/HTSlib/1.10.2-GCC-8.3.0/include -I/sw/eb/sw/XZ/5.2.4-GCCcore-8.3.0/include -I/sw/eb/sw/zlib/1.2.11-GCCcore-8.3.0/include -I/sw/eb/sw/bzip2/1.0.8-GCCcore-8.3.0/include  
-HTS_LIBS = -L/sw/eb/sw/HTSlib/1.10.2-GCC-8.3.0/lib -lhts  
-
-
-PKG_CPPFLAGS = $(HTS_CFLAGS)
-PKG_LIBS = $(HTS_LIBS) 

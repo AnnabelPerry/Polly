@@ -21,4 +21,4 @@ fi
 AC_SUBST(HTS_CFLAGS)
 AC_SUBST(HTS_LIBS)
 
-AC_OUTPUT(Makevars)
+AC_OUTPUT(src/Makevars)

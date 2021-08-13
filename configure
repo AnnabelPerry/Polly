@@ -585,10 +585,6 @@ ac_subst_vars='LTLIBOBJS
 LIBOBJS
 HTS_LIBS
 HTS_CFLAGS
-BZIP2_LIBS
-BZIP2_CFLAGS
-ZLIB_LIBS
-ZLIB_CFLAGS
 PKG_CONFIG
 target_alias
 host_alias
@@ -1714,20 +1710,6 @@ fi
 
 ## If pkg-config was found, let's use it
 if test "${PKG_CONFIG}" != ""; then
-    # If pkg-config has ZLIB information, proceed
-    if test "${PKG_CONFIG} --exists 'zlib' --print-errors" != ""; then
-        ZLIB_CFLAGS=`${PKG_CONFIG} --cflags zlib`
-        ZLIB_LIBS=`${PKG_CONFIG} --libs zlib`
-    else
-        as_fn_error $? "ZLIB not found, is zlib installed?" "$LINENO" 5
-    fi
-    # If pkg-config has BZIP2 information, proceed
-    if test "${PKG_CONFIG} --exists 'bzip2' --print-errors" != ""; then
-        BZIP2_CFLAGS=`${PKG_CONFIG} --cflags bzip2`
-        BZIP2_LIBS=`${PKG_CONFIG} --libs bzip2`
-    else
-        as_fn_error $? "BZIP2 not found, is bzip2 installed?" "$LINENO" 5
-    fi
     # If pkg-config has HTS information, proceed
     if test "${PKG_CONFIG} --exists 'htslib' --print-errors" != ""; then
         HTS_CFLAGS=`${PKG_CONFIG} --cflags htslib`
@@ -1740,10 +1722,6 @@ else
 fi
 
 # Now substitute these variables in Makevars.in to create src/Makevars
-
-
-
-
 
 
 
@@ -2903,4 +2881,3 @@ if test -n "$ac_unrecognized_opts" && test "$enable_option_checking" != no; then
   { $as_echo "$as_me:${as_lineno-$LINENO}: WARNING: unrecognized options: $ac_unrecognized_opts" >&5
 $as_echo "$as_me: WARNING: unrecognized options: $ac_unrecognized_opts" >&2;}
 fi
-

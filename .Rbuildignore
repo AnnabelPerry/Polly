@@ -1,0 +1,9 @@
+^.*\.Rproj$
+^\.Rproj\.user$
+^notes.txt
+^\.travis\.yml$
+^tests/.*\.Rout.save
+^\.codecov\.yml$
+^.editorconfig$
+.*\.tar.gz$
+^\.github

@@ -12,6 +12,10 @@
 #include "htslib/sam.h"
 #include <Rcpp.h>
 #include "PollyR.h"
+#include <sys/resource.h>
+#include <stdio.h>
+#include <errno.h>
+#include <unistd.h>
 
 // Create constants to enable opening of tab and comma separated files
 // NOTE: dos2unix CSV file prior to opening
@@ -126,387 +130,410 @@ Rcpp::CharacterMatrix PollySI(std::string freq_name, std::vector<std::string> de
 
 // Function IV: Genotypes microsats in an individual
 void MicroGenotyper(std::vector<std::string> bam_vec, std::string lookup_file, std::vector<std::string> desired_scaffolds, std::vector<std::string> output_names){
+  // Open lookup table as VoV
+  std::vector<std::vector<std::string>> lookup_table;
+  std::ifstream file(lookup_file);
+  std::string csv_line{};
 
-    // Open lookup table as VoV
-    std::vector<std::vector<std::string>> lookup_table;
-    std::ifstream file(lookup_file);
-    std::string csv_line{};
-    while (file && getline(file, csv_line)) {
-      std::vector<std::string> row{ std::sregex_token_iterator(csv_line.begin(),csv_line.end(),comma_it,-1), std::sregex_token_iterator() };
-      lookup_table.push_back(row);
-    }
-    // Erases the row with column names
-    lookup_table.erase(lookup_table.begin());
-    file.close();
-    // Objects needed in following loop
-    std::string ind_bam;
-    const char * char_bam;
-    std::string chr;
-    std::string lookup_locus;
-    std::string allele_pair;
-    // sam_bp and ID_bp_counter must be intitialized as unsigned integer to avoid downstream compilation errors
-    unsigned int sam_bp;
-    int motif_bp;
-    unsigned int ID_bp_counter;
-    int frequent_variant;
-    int current_variant;
-    int current_copies;
-    // Must be set to 0 so you can check if it has been found later
-    int second_variant = 0;
-    int second_copies = 0;
-    int largest_copies = 0;
-    int repeats_count = 0;
-    bool break_both = false;
-    std::string seq_string = "";
-    std::vector<std::string> seq_vec;
-    std::vector<std::vector<std::string>> mapped_reads;
-    int first_pos;
-    std::string first_pos_str;
-    std::string locus_chr;
-    const char * char_locus_chr;
+  while (file && getline(file, csv_line)) {
+    std::vector<std::string> row{ std::sregex_token_iterator(csv_line.begin(),csv_line.end(),comma_it,-1), std::sregex_token_iterator() };
+    lookup_table.push_back(row);
+  }
 
-    // Repeat this function for each bam file in the bam vector
-    for(unsigned int bam = 0; bam < bam_vec.size(); bam++){
-        // Store name of the current bam in a single string
-        ind_bam = bam_vec[bam];
-        // Convert string describing individual bam file to a character constant
-        char_bam = ind_bam.c_str();
+  // Erases the row with column names
+  lookup_table.erase(lookup_table.begin());
+  file.close();
+  // Objects needed in following loop
+  std::string ind_bam;
+  const char * char_bam;
+  std::string chr;
+  std::string lookup_locus;
+  std::string allele_pair;
+  std::string forward_slash = "/";
+  // sam_bp and ID_bp_counter must be intitialized as unsigned integer to avoid downstream compilation errors
+  unsigned int sam_bp;
+  int motif_bp;
+  unsigned int ID_bp_counter;
+  int frequent_variant;
+  int current_variant;
+  int current_copies;
+  // Must be set to 0 so you can check if it has been found later
+  int second_variant = 0;
+  int second_copies = 0;
+  int largest_copies = 0;
+  int repeats_count = 0;
+  bool break_both = false;
+  std::string seq_string = "";
+  std::vector<std::string> seq_vec;
+  std::vector<std::vector<std::string>> mapped_reads;
+  int first_pos;
+  std::string first_pos_str;
+  std::string locus_chr;
+  const char * char_locus_chr;
 
-    	// File into which genotypes for each locus will be reported
-    	std::ofstream output_file;
-    	std::string current_output = output_names[bam];
-	    output_file.open(current_output);
-	    output_file << "Scaffold,Locus,Motif,Genotype\n";
 
+  // Repeat this function for each bam file in the bam vector
+  for(unsigned int bam = 0; bam < bam_vec.size(); bam++){
+
+    // EDIT: Delete before final product
+    int running_loci_count = 0;
+    int read_depth = 0;
+    std::ofstream RD_LOCI;
+    RD_LOCI.open("RD_LociCount.txt");
+//////////////////////////////////////////////////////
+
+    // Store name of the current bam in a single string
+    ind_bam = bam_vec[bam];
+    // Convert string describing individual bam file to a character constant
+    char_bam = ind_bam.c_str();
+    // Open a bam file
+    samFile *bam_file = sam_open(char_bam, "r");
+    // Load the header of the bam file
+    bam_hdr_t *header = sam_hdr_read(bam_file);
+    // Initialize the alignment of the bam file
+    bam1_t *b = bam_init1();
+
+    // File into which genotypes for each locus will be reported
+    std::ofstream output_file;
+    std::string current_output = output_names[bam];
+    output_file.open(current_output);
+    output_file << "Scaffold,Locus,Motif,Genotype\n";
+
+    for(unsigned int row = 0; row < lookup_table.size(); row++){
+      /*
+       * This map will TEMPORARILY house the count of all genotypes with a
+       * certain number of repeats in a single sam file.
+       * NOTE: Don't get confused! The KEY and VALUE are BOTH integers, but
+       * the KEY is the GENOTYPE while the VALUE is the NUMBER OF READS with
+       * that genotype.
+       */
+       // UNTESTED: Clear mapped reads each time you enter a new locus
         // Re-initalize objects needed in for-loop
-    	ID_bp_counter = 0;
-    	repeats_count = 0;
-    	frequent_variant;
-    	largest_copies = 0;
-    	second_variant = 0;
-    	second_copies = 0;
-    	break_both = false;
-    	seq_string = "";
-    	seq_vec.clear();
-    	mapped_reads.clear();
+        ID_bp_counter = 0;
+        repeats_count = 0;
+        frequent_variant;
+        largest_copies = 0;
+        second_variant = 0;
+        second_copies = 0;
+        break_both = false;
+        seq_string = "";
+        seq_vec.clear();
+        mapped_reads.clear();
         first_pos_str = "";
+      std::map<int, int> scratch_genotypes;
 
-    	for(unsigned int row = 0; row < lookup_table.size(); row++){
-          /*
-        	* This map will TEMPORARILY house the count of all genotypes with a
-        	* certain number of repeats in a single sam file.
-        	* NOTE: Don't get confused! The KEY and VALUE are BOTH integers, but
-        	* the KEY is the GENOTYPE while the VALUE is the NUMBER OF READS with
-        	* that genotype.
-        	*/
-        	std::map<int, int> scratch_genotypes;
+      chr = lookup_table[row][3];
 
-    		chr = lookup_table[row][3];
+      /*
+       * Check if the current scaffold is one of the desired scaffolds
+       */
+      if(std::count(desired_scaffolds.begin(), desired_scaffolds.end(), chr) != 0){
+        lookup_locus = lookup_table[row][0];
+        ///////////////////////////////////////////////////////////////////////
+        /////////////// Memory Consuming Step (~5800 KB/locus) ///////////////
+        ///////////////////////////////////////////////////////////////////////
+        /*
+         * Obtain all reads which could possibly house the current look-
+         * up locus.
+         */
+        // Load the current read index (0) in the bam file
+        hts_idx_t *idx = sam_index_load(bam_file, char_bam);
+        // Create an iterator to move through the bam file
+        locus_chr = chr;
+        locus_chr.append(":");
+        locus_chr.append(lookup_locus);
+        locus_chr.append("-");
+        locus_chr.append(lookup_locus);
+        char_locus_chr = locus_chr.c_str();
+        hts_itr_t *iterator = sam_itr_querys(idx, header, char_locus_chr);
+        /*
+         * So long as there is another iterator after the current one, check that the
+         * read id is valid. If so, store the start and end positions in a VoV
+         */
+        while (sam_itr_next(bam_file, iterator, b) >= 0) {
+          if (b->core.tid < 0){
+            continue;
+          }else if(b->core.qual >= 10){
+            first_pos = b->core.pos;
+            first_pos_str = std::__cxx11::to_string(b->core.pos);
+            seq_vec.push_back(first_pos_str);
+            for(int i = 0; i < b->core.l_qseq; i++){
+              if(bam_seqi(bam_get_seq(b), i) == 1){
+                seq_string.append("A");
+              }else if(bam_seqi(bam_get_seq(b), i) == 2){
+                seq_string.append("C");
+              }else if(bam_seqi(bam_get_seq(b), i) == 4){
+                seq_string.append("G");
+              }else if(bam_seqi(bam_get_seq(b), i) == 8){
+                seq_string.append("T");
+              }
+            }
+            seq_vec.push_back(seq_string);
+            seq_string.clear();
+            mapped_reads.push_back(seq_vec);
+            seq_vec.clear();
+          }
+        }
+        hts_itr_destroy(iterator);
+        ///////////////////////////////////////////////////////////////////////
 
-    		/*
-    		* Check if the current scaffold is one of the desired scaffolds
-    		*/
-    		if(std::count(desired_scaffolds.begin(), desired_scaffolds.end(), chr) != 0){
-        		lookup_locus = lookup_table[row][0];
-                /*
-                * Obtain all reads which could possibly house the current look-
-                * up locus.
-                */
-                // Open a bam file
-                samFile *bam_file = sam_open(char_bam, "r");
-                // Load the current read index (0) in the bam file
-                hts_idx_t *idx = sam_index_load(bam_file, char_bam);
-                // Load the header of the bam file
-                bam_hdr_t *header = sam_hdr_read(bam_file);
-                // Initialize the alignment of the bam file
-                bam1_t *b = bam_init1();
-                // Create an iterator to move through the bam file
-                locus_chr = chr;
-                locus_chr.append(":");
-                locus_chr.append(lookup_locus);
-                locus_chr.append("-");
-                locus_chr.append(lookup_locus);
-                char_locus_chr = locus_chr.c_str();
-                hts_itr_t *iterator = sam_itr_querys(idx, header, char_locus_chr);
-                /*
-                * So long as there is another iterator after the current one, check that the
-                * read id is valid. If so, store the start and end positions in a VoV
-                */
-                while (sam_itr_next(bam_file, iterator, b) >= 0) {
-                    if (b->core.tid < 0){
-                        continue;
-                    }else if(b->core.qual >= 10){
-                        first_pos = b->core.pos;
-                        first_pos_str = std::__cxx11::to_string(b->core.pos);
-                        seq_vec.push_back(first_pos_str);
-                        for(int i = 0; i < b->core.l_qseq; i++){
-                            if(bam_seqi(bam_get_seq(b), i) == 1){
-                                seq_string.append("A");
-                            }else if(bam_seqi(bam_get_seq(b), i) == 2){
-                                seq_string.append("C");
-                            }else if(bam_seqi(bam_get_seq(b), i) == 4){
-                                seq_string.append("G");
-                            }else if(bam_seqi(bam_get_seq(b), i) == 8){
-                                seq_string.append("T");
-                            }
-                        }
-                        seq_vec.push_back(seq_string);
-                        seq_string.clear();
-                        mapped_reads.push_back(seq_vec);
-                        seq_vec.clear();
+        /*
+         * If the vector of mapped reads is empty, then the individual does
+         * not have any reads mapped to this locus, so this individual's
+         * reads at this locus should be skipped.
+         */
+        if (mapped_reads.empty()){
+          continue;
+        }else{
+            // EDIT: Delete before finalizing package
+            running_loci_count++;
+    
+            /*
+             * Genotype each read, adding to the INDIVIDUAL's genotype
+             * table.
+             */
+            for(unsigned int i = 0; i < mapped_reads.size(); i++){
+              // EDIT: Delete before final product
+              read_depth += mapped_reads.size();
+              
+              /*
+               * Set the first locus of the microsat equal to the the point
+               * at which the first motif SHOULD occur if the current sam
+               * sequence has a motif.
+               * Some microsat loci are present, but don't begin at exactly
+               * the same locus as the reference microsat. So, you want to
+               * also check the loci -/+2 bp from the known microsat locus
+               * to see if the microsat starts there.
+               */
+              sam_bp = std::__cxx11::stoi(lookup_table[row][0]) - std::__cxx11::stoi(mapped_reads[i][0]);
+              /*
+               * Set the first base pair in the motif equal to 0 so you can
+               * check if the motif is found in the current sam sequence.
+               */
+              motif_bp = 0;
+              /*
+               * Check if the current read has a microsatellite starting
+               * anywhere within 5bp of the microsat locus indicated in
+               * the lookup table.
+               */
+              for(int pos = 0; pos < 5; pos++){
+                if(mapped_reads[i][1][sam_bp] != lookup_table[row][2][motif_bp]){
+                  sam_bp++;
+                  continue;
+                }else if(mapped_reads[i][1][sam_bp] == lookup_table[row][2][motif_bp]){
+                  /*
+                   * Begin counting the number of base pairs which are
+                   * identical between the lookup motif and the current
+                   * sam sequence.
+                   */
+                  while(sam_bp < (mapped_reads[i][1].size() + 2)){
+                    /*
+                     * If the current number of identical base pairs
+                     * is less than the size of the motif and the
+                     * current motif and sam_bp match each other,
+                     * count this as an identical base pair and move
+                     * to the next base pair.
+                     */
+                    if((ID_bp_counter < lookup_table[row][2].size()) && ((mapped_reads[i][1][sam_bp] == lookup_table[row][2][motif_bp]))){
+                      ID_bp_counter++;
+                      motif_bp++;
+                      sam_bp++;
+                      continue;
+                      /*
+                       * If a full motif is detected, increment the
+                       * count of repeats by one and start at the
+                       * beginning of the motif to see if there are any
+                       * other repeats in the current sequence.
+                       */
+                    }else if(ID_bp_counter == lookup_table[row][2].size()){
+                      repeats_count++;
+                      motif_bp = 0;
+                      ID_bp_counter = 0;
+                      continue;
+                      /*
+                       * If repeats have already been detected but the
+                       * current sam bp does not align with the
+                       * corresponding motif bp OR the read has ended,
+                       * the microsat has ended. Thus, you must break
+                       * out of JUST the current loop to add the genotype
+                       * information to the output 2D vector.
+                       */
+                    }else if((repeats_count > 0) && ((mapped_reads[i][1][sam_bp] != lookup_table[row][2][motif_bp]) || (sam_bp > mapped_reads[i][1].length()))){
+                      motif_bp = 0;
+                      break;
+                      /*
+                       * If repeats have not been detected but the
+                       * current sam bp no longer aligns with the motif,
+                       * don't output the lookup row's information.
+                       * Simply skip to the next read, as this one
+                       * lacks a full motif.
+                       */
+                    }else if((repeats_count == 0)&&((mapped_reads[i][1][sam_bp] != lookup_table[row][2][motif_bp]))){
+                      break_both = true;
+                      motif_bp = 0;
+                      ID_bp_counter = 0;
+                      break;
                     }
+                  }
+                  /*
+                   * If the for loop was broken because the sam sequence
+                   * did not contain any repeats, move to the next base
+                   * pair in position.
+                   */
+                  if(break_both){
+                    break_both = false;
+                    continue;
+                  }
+                  /*
+                   * Once you are finished genotyping a read, check if
+                   * it has been counted in this individual at this
+                   * locus before. If not, add a new entry to the
+                   * scratch genotypes and move to the next read in the
+                   * file.
+                   */
+                  std::map<int, int>::iterator rep;
+                  rep = scratch_genotypes.find(repeats_count); // Map find searches only for KEYS, so you need not specify ->first
+                  if(rep == scratch_genotypes.end()){
+                    scratch_genotypes.insert(std::pair<int, int>(repeats_count,1));
+                    repeats_count = 0;
+                    sam_bp = 0;
+                    motif_bp = 0;
+                    ID_bp_counter = 0;
+                    break;
+                    /*
+                     * If the genotype of the current read HAS been
+                     * recorded previously, increment its count by one,
+                     * clear variables, and move to the next read.
+                     */
+                  }else{
+                    scratch_genotypes.find(repeats_count)->second = scratch_genotypes.find(repeats_count)->second + 1;
+                    repeats_count = 0;
+                    sam_bp = 0;
+                    motif_bp = 0;
+                    ID_bp_counter = 0;
+                    break;
+                  }
+                  /*
+                   If the current sam read doesn't have a microsat motif at the indicated position, skip it.
+                   */
+                }else{
+                  continue;
                 }
-                bam_destroy1(b);
-                hts_itr_destroy(iterator);
-                bam_hdr_destroy(header);
-                sam_close(bam_file);
-
-        	    /*
-        		* If the vector of mapped reads is empty, then the individual does
-        		* not have any reads mapped to this locus, so this individual's
-        		* reads at this locus should be skipped.
-        		*/
-        		if (mapped_reads.empty()){
-        			continue;
-        		}
-
-        		/*
-        		* Genotype each read, adding to the INDIVIDUAL's genotype
-        		* table.
-        		*/
-        		for(unsigned int i = 0; i < mapped_reads.size(); i++){
-        			/*
-        			* Set the first locus of the microsat equal to the the point
-        			* at which the first motif SHOULD occur if the current sam
-        			* sequence has a motif.
-        			* Some microsat loci are present, but don't begin at exactly
-        			* the same locus as the reference microsat. So, you want to
-        			* also check the loci -/+2 bp from the known microsat locus
-        			* to see if the microsat starts there.
-        			*/
-        			sam_bp = std::__cxx11::stoi(lookup_table[row][0]) - std::__cxx11::stoi(mapped_reads[i][0]);
-        			/*
-        			* Set the first base pair in the motif equal to 0 so you can
-        			* check if the motif is found in the current sam sequence.
-        			*/
-        			motif_bp = 0;
-        			/*
-        			* Check if the current read has a microsatellite starting
-        			* anywhere within 5bp of the microsat locus indicated in
-        			* the lookup table.
-        			*/
-        			for(int pos = 0; pos < 5; pos++){
-        				if(mapped_reads[i][1][sam_bp] != lookup_table[row][2][motif_bp]){
-        					sam_bp++;
-        					continue;
-        				}else if(mapped_reads[i][1][sam_bp] == lookup_table[row][2][motif_bp]){
-        					/*
-        					* Begin counting the number of base pairs which are
-        					* identical between the lookup motif and the current
-        					* sam sequence.
-        					*/
-        					while(sam_bp < (mapped_reads[i][1].size() + 2)){
-        						/*
-        						* If the current number of identical base pairs
-        						* is less than the size of the motif and the
-        						* current motif and sam_bp match each other,
-        						* count this as an identical base pair and move
-        						* to the next base pair.
-        						*/
-        						if((ID_bp_counter < lookup_table[row][2].size()) && ((mapped_reads[i][1][sam_bp] == lookup_table[row][2][motif_bp]))){
-        							ID_bp_counter++;
-        							motif_bp++;
-        							sam_bp++;
-        							continue;
-        						/*
-        						* If a full motif is detected, increment the
-        						* count of repeats by one and start at the
-        						* beginning of the motif to see if there are any
-        						* other repeats in the current sequence.
-        						*/
-        						}else if(ID_bp_counter == lookup_table[row][2].size()){
-        							repeats_count++;
-        							motif_bp = 0;
-        							ID_bp_counter = 0;
-        							continue;
-        						/*
-        						* If repeats have already been detected but the
-        						* current sam bp does not align with the
-        						* corresponding motif bp OR the read has ended,
-        						* the microsat has ended. Thus, you must break
-        						* out of JUST the current loop to add the genotype
-        						* information to the output 2D vector.
-        						*/
-        						}else if((repeats_count > 0) && ((mapped_reads[i][1][sam_bp] != lookup_table[row][2][motif_bp]) || (sam_bp > mapped_reads[i][1].length()))){
-        							motif_bp = 0;
-        							break;
-        						/*
-        						* If repeats have not been detected but the
-        						* current sam bp no longer aligns with the motif,
-        						* don't output the lookup row's information.
-        						* Simply skip to the next read, as this one
-        						* lacks a full motif.
-        						*/
-        						}else if((repeats_count == 0)&&((mapped_reads[i][1][sam_bp] != lookup_table[row][2][motif_bp]))){
-        							break_both = true;
-        							motif_bp = 0;
-        					    	ID_bp_counter = 0;
-        							break;
-        						}
-        					}
-        					/*
-        					* If the for loop was broken because the sam sequence
-        					* did not contain any repeats, move to the next base
-        					* pair in position.
-        					*/
-        					if(break_both){
-        						break_both = false;
-        						continue;
-        					}
-        					/*
-        					* Once you are finished genotyping a read, check if
-        					* it has been counted in this individual at this
-        					* locus before. If not, add a new entry to the
-        					* scratch genotypes and move to the next read in the
-        					* file.
-        					*/
-        					std::map<int, int>::iterator rep;
-        					rep = scratch_genotypes.find(repeats_count); // Map find searches only for KEYS, so you need not specify ->first
-        					if(rep == scratch_genotypes.end()){
-        						scratch_genotypes.insert(std::pair<int, int>(repeats_count,1));
-        						repeats_count = 0;
-        						sam_bp = 0;
-        						motif_bp = 0;
-    							ID_bp_counter = 0;
-								break;
-    							/*
-        						* If the genotype of the current read HAS been
-        						* recorded previously, increment its count by one,
-        						* clear variables, and move to the next read.
-        						*/
-        						}else{
-        							scratch_genotypes.find(repeats_count)->second = scratch_genotypes.find(repeats_count)->second + 1;
-        							repeats_count = 0;
-        							sam_bp = 0;
-        							motif_bp = 0;
-        							ID_bp_counter = 0;
-        							break;
-        						}
-        						/*
-        						If the current sam read doesn't have a microsat motif at the indicated position, skip it.
-        						*/
-        					}else{
-        						continue;
-        					}
-        				continue;
-        			}
-        		}
-        		repeats_count = 0;
-        		sam_bp = 0;
-        		motif_bp = 0;
-        		ID_bp_counter = 0;
-        		/*
-        		Once you've genotyped every read (including SE reads) for the current locus of the current individual, identify the two alleles which were
-        		most common and output them in a single string as "allele1/allele2".
-        		*/
-
-        		// First, make sure reads were actually genotyped (it is possible that all reads for this locus had very low map quality scores)
-        		if(!scratch_genotypes.empty()){
-        			// Iterate through each member of the map and find the value of "second" which is largest
-        			std::map<int, int>::iterator variant;
-        			for(variant = scratch_genotypes.begin(); variant != scratch_genotypes.end(); variant++){
-        					current_variant = variant -> first;
-        					current_copies = variant -> second;
-        					if(current_copies > largest_copies){
-        						frequent_variant = current_variant;
-
-        						largest_copies = current_copies;
-        						continue;
-        					}else{
-        						continue;
-        					}
-        				}
-        			// Check if the current most frequent variant has 2x as many reads as any other variant.
-        			std::map<int, int>::iterator variant2;
-        			bool two_times_larger = true;
-        			for(variant2 = scratch_genotypes.begin(); variant2 != scratch_genotypes.end(); variant2++){
-        					current_variant = variant2 ->first;
-        					current_copies = variant2 ->second;
-        					// First, make sure the current number of repeats does not equal the most common number of repeats to ensure you don't count the most common variant's number of copies as NOT two times larger than it's own number of copies.
-        					if((current_variant != frequent_variant) && (largest_copies >= 2*current_copies)){
-        						continue;
-        					}else if((current_variant != frequent_variant) && (largest_copies < 2*current_copies)){
-        						two_times_larger = false;
-        						current_copies = 0;
-        						break;
-        					}
-        				}
-        			/*
-        			Homozygous Conditions:
-        			If the variant which appears on the greatest number of reads has 2x as many reads as any other variant, assume the individual has only
-        			ONE true genotype and is thus HOMOZYGOUS.
-        			Output the genotype for this locus and move to the next locus.
-        			*/
-        			if(two_times_larger){
-        			    allele_pair = std::to_string(frequent_variant);
-        			    allele_pair.append("/");
-        			    allele_pair.append(std::to_string(frequent_variant));
-
-        				output_file << chr << "," << lookup_locus << "," << lookup_table[row][2] << "," << allele_pair << std::endl;
-        				// Clean all relevant objects for the next locus.
-        				mapped_reads.clear();
-        				second_copies = 0;
-        				largest_copies = 0;
-        				current_copies = 0;
-        				continue;
-        			/*
-        			Heterozygous Conditions:
-        			If the allele with the greatest number of copies does NOT have 2x as many copies as any other allele, find the allele found in the second
-        			greatest number of reads and add both to the output.
-        			*/
-        			}else{
-        				// Find the second most frequent variant in the individual's reads for this locus
-        				std::map<int, int>::iterator variant3;
-        				for(variant3 = scratch_genotypes.begin(); variant3 != scratch_genotypes.end(); variant3++){
-        					current_variant = variant3 -> first;
-        					current_copies = variant3 -> second;
-        					if((current_variant != frequent_variant) && (current_copies <= largest_copies) && (current_copies >= second_copies)){
-        						second_variant = current_variant;
-        						second_copies = current_copies;
-        						continue;
-        						}else{
-        							continue;
-        						}
-        					}
-        				// If a second largest variant was found, output it as an official allele and move to the next locus.
-        				if(second_variant != 0){
-        				    allele_pair = std::to_string(frequent_variant);
-            			    allele_pair.append("/");
-            			    allele_pair.append(std::to_string(second_variant));
-
-        					output_file << chr << "," << lookup_locus << "," << lookup_table[row][2] << "," << allele_pair << std::endl;
-        					/*
-        					* Clean all relevant objects for the next locus.
-        					*/
-        					mapped_reads.clear();
-        					second_copies = 0;
-        					largest_copies = 0;
-        					current_copies = 0;
-        					continue;
-        				}
-        			}
-        		// If the map quality of ALL reads in this individual were too low to be genotyped, skip to the next locus
-        		}else{
-        			continue;
-        		}
-        	/*
-        	* If the current scaffold is not one of the desired scaffolds, don't
-        	* find genotypes for this locus.
-        	*/
-        	}else{
-        	    continue;
-        	}
-    	}
+                continue;
+              }
+            }
+            repeats_count = 0;
+            sam_bp = 0;
+            motif_bp = 0;
+            ID_bp_counter = 0;
+            /*
+             Once you've genotyped every read (including SE reads) for the current locus of the current individual, identify the two alleles which were
+             most common and output them in a single string as "allele1/allele2".
+             */
+    
+            // First, make sure reads were actually genotyped (it is possible that all reads for this locus had very low map quality scores)
+            if(!scratch_genotypes.empty()){
+              // Iterate through each member of the map and find the value of "second" which is largest
+              std::map<int, int>::iterator variant;
+              for(variant = scratch_genotypes.begin(); variant != scratch_genotypes.end(); variant++){
+                current_variant = variant -> first;
+                current_copies = variant -> second;
+                if(current_copies > largest_copies){
+                  frequent_variant = current_variant;
+    
+                  largest_copies = current_copies;
+                  continue;
+                }else{
+                  continue;
+                }
+              }
+              // Check if the current most frequent variant has 2x as many reads as any other variant.
+              std::map<int, int>::iterator variant2;
+              bool two_times_larger = true;
+              for(variant2 = scratch_genotypes.begin(); variant2 != scratch_genotypes.end(); variant2++){
+                current_variant = variant2 ->first;
+                current_copies = variant2 ->second;
+                // First, make sure the current number of repeats does not equal the most common number of repeats to ensure you don't count the most common variant's number of copies as NOT two times larger than it's own number of copies.
+                if((current_variant != frequent_variant) && (largest_copies >= 2*current_copies)){
+                  continue;
+                }else if((current_variant != frequent_variant) && (largest_copies < 2*current_copies)){
+                  two_times_larger = false;
+                  current_copies = 0;
+                  break;
+                }
+              }
+              /*
+               Homozygous Conditions:
+               If the variant which appears on the greatest number of reads has 2x as many reads as any other variant, assume the individual has only
+               ONE true genotype and is thus HOMOZYGOUS.
+               Output the genotype for this locus and move to the next locus.
+               */
+              if(two_times_larger){
+                allele_pair = std::to_string(frequent_variant);
+                allele_pair.append(forward_slash);
+                allele_pair.append(std::to_string(frequent_variant));
+    
+                output_file << chr << "," << lookup_locus << "," << lookup_table[row][2] << "," << allele_pair << std::endl;
+                // Clean all relevant objects for the next locus.
+                mapped_reads.clear();
+                second_copies = 0;
+                largest_copies = 0;
+                current_copies = 0;
+                continue;
+                /*
+                 Heterozygous Conditions:
+                 If the allele with the greatest number of copies does NOT have 2x as many copies as any other allele, find the allele found in the second
+                 greatest number of reads and add both to the output.
+                 */
+              }else{
+                // Find the second most frequent variant in the individual's reads for this locus
+                std::map<int, int>::iterator variant3;
+                for(variant3 = scratch_genotypes.begin(); variant3 != scratch_genotypes.end(); variant3++){
+                  current_variant = variant3 -> first;
+                  current_copies = variant3 -> second;
+                  if((current_variant != frequent_variant) && (current_copies <= largest_copies) && (current_copies >= second_copies)){
+                    second_variant = current_variant;
+                    second_copies = current_copies;
+                    continue;
+                  }else{
+                    continue;
+                  }
+                }
+                // If a second largest variant was found, output it as an official allele and move to the next locus.
+                if(second_variant != 0){
+                  allele_pair = std::to_string(frequent_variant);
+                  allele_pair.append(forward_slash);
+                  allele_pair.append(std::to_string(second_variant));
+    
+                  output_file << chr << "," << lookup_locus << "," << lookup_table[row][2] << "," << allele_pair << std::endl;
+                  /*
+                   * Clean all relevant objects for the next locus.
+                   */
+                  mapped_reads.clear();
+                  second_copies = 0;
+                  largest_copies = 0;
+                  current_copies = 0;
+                  continue;
+                }
+              }
+              // If the map quality of ALL reads in this individual were too low to be genotyped, skip to the next locus
+            }else{
+              continue;
+            }
+        }
+        /*
+        * If the current scaffold is not one of the desired scaffolds, don't
+        * find genotypes for this locus.
+        */
+        }else{
+            continue;
+        }
+    }
+    bam_destroy1(b);
+    bam_hdr_destroy(header);
+    sam_close(bam_file);
+    //EDIT: Remove before final product
+    RD_LOCI << "Total number of microsat loci found in " << ind_bam << ": " << running_loci_count << std::endl << "Total Read Depth of " << ind_bam << ": " << read_depth << std::endl;
     }
 }
 
@@ -776,6 +803,25 @@ void Polly(int region_size, std::vector<std::string> desired_scaffolds, double S
 
     // Repeat this function for each bam file in the bam vector
     for(unsigned int bam = 0; bam < bam_vec.size(); bam++){
+        
+        // EDIT: Delete before final product
+        int running_loci_count = 0;
+        int read_depth = 0;
+        std::ofstream RD_LOCI;
+        RD_LOCI.open("RD_LociCount.txt");
+//////////////////////////////////////////////////////
+
+        // Store name of the current bam in a single string
+        ind_bam = bam_vec[bam];
+        // Convert string describing individual bam file to a character constant
+        char_bam = ind_bam.c_str();
+        // Open a bam file
+        samFile *bam_file = sam_open(char_bam, "r");
+        // Load the header of the bam file
+        bam_hdr_t *header = sam_hdr_read(bam_file);
+        // Initialize the alignment of the bam file
+        bam1_t *b = bam_init1();
+    
         // Objects which must be reset to with each new individual
     	repeats_count = 0;
 	    largest_copies = 0;
@@ -799,32 +845,33 @@ void Polly(int region_size, std::vector<std::string> desired_scaffolds, double S
         	std::map<int, int> scratch_genotypes;
 
     		chr = lookup_table[row][3];
-    		mapped_reads.clear();
+    		// Re-initalize objects needed in for-loop
+            ID_bp_counter = 0;
+            repeats_count = 0;
+            frequent_variant;
+            largest_copies = 0;
+            second_variant = 0;
+            second_copies = 0;
+            break_both = false;
+            seq_string = "";
+            seq_vec.clear();
+            mapped_reads.clear();
+            first_pos_str = "";
+
     		/*
     		Check if the current scaffold is one of the desired scaffolds
     		*/
     		if(std::count(desired_scaffolds.begin(), desired_scaffolds.end(), chr) != 0){
-        		lookup_locus = lookup_table[row][0];
-        		/*
-        		* The locus identifier is the string which uniquely identifies
-        		* the present locus.
-        		* Locus identifiers look like this: ScyDAA6_1_HRSCAF_23%2874
-        		*/
-        		locus_identifier = chr;
-        		locus_identifier.append(percent);
-        		locus_identifier.append(lookup_locus);
-        		/*
-                * Obtain all reads which could possibly house the current look-
-                * up locus.
-                */
-                // Open a bam file
-                samFile *bam_file = sam_open(char_bam, "r");
+                lookup_locus = lookup_table[row][0];
+                ///////////////////////////////////////////////////////////////////////
+                /////////////// Memory Consuming Step (~5800 KB/locus) ///////////////
+                ///////////////////////////////////////////////////////////////////////
+                /*
+                 * Obtain all reads which could possibly house the current look-
+                 * up locus.
+                 */
                 // Load the current read index (0) in the bam file
                 hts_idx_t *idx = sam_index_load(bam_file, char_bam);
-                // Load the header of the bam file
-                bam_hdr_t *header = sam_hdr_read(bam_file);
-                // Initialize the alignment of the bam file
-                bam1_t *b = bam_init1();
                 // Create an iterator to move through the bam file
                 locus_chr = chr;
                 locus_chr.append(":");
@@ -834,37 +881,35 @@ void Polly(int region_size, std::vector<std::string> desired_scaffolds, double S
                 char_locus_chr = locus_chr.c_str();
                 hts_itr_t *iterator = sam_itr_querys(idx, header, char_locus_chr);
                 /*
-                * So long as there is another iterator after the current one, check that the
-                * read id is valid. If so, store the start and end positions in a VoV
-                */
+                 * So long as there is another iterator after the current one, check that the
+                 * read id is valid. If so, store the start and end positions in a VoV
+                 */
                 while (sam_itr_next(bam_file, iterator, b) >= 0) {
-                    if (b->core.tid < 0){
-                        continue;
-                    }else if(b->core.qual >= 10){
-                        first_pos = b->core.pos;
-                        first_pos_str = std::__cxx11::to_string(b->core.pos);
-                        seq_vec.push_back(first_pos_str);
-                        for(int i = 0; i < b->core.l_qseq; i++){
-                            if(bam_seqi(bam_get_seq(b), i) == 1){
-                                seq_string.append("A");
-                            }else if(bam_seqi(bam_get_seq(b), i) == 2){
-                                seq_string.append("C");
-                            }else if(bam_seqi(bam_get_seq(b), i) == 4){
-                                seq_string.append("G");
-                            }else if(bam_seqi(bam_get_seq(b), i) == 8){
-                                seq_string.append("T");
-                            }
-                        }
-                        seq_vec.push_back(seq_string);
-                        seq_string.clear();
-                        mapped_reads.push_back(seq_vec);
-                        seq_vec.clear();
+                  if (b->core.tid < 0){
+                    continue;
+                  }else if(b->core.qual >= 10){
+                    first_pos = b->core.pos;
+                    first_pos_str = std::__cxx11::to_string(b->core.pos);
+                    seq_vec.push_back(first_pos_str);
+                    for(int i = 0; i < b->core.l_qseq; i++){
+                      if(bam_seqi(bam_get_seq(b), i) == 1){
+                        seq_string.append("A");
+                      }else if(bam_seqi(bam_get_seq(b), i) == 2){
+                        seq_string.append("C");
+                      }else if(bam_seqi(bam_get_seq(b), i) == 4){
+                        seq_string.append("G");
+                      }else if(bam_seqi(bam_get_seq(b), i) == 8){
+                        seq_string.append("T");
+                      }
                     }
+                    seq_vec.push_back(seq_string);
+                    seq_string.clear();
+                    mapped_reads.push_back(seq_vec);
+                    seq_vec.clear();
+                  }
                 }
-                bam_destroy1(b);
                 hts_itr_destroy(iterator);
-                bam_hdr_destroy(header);
-                sam_close(bam_file);
+                ///////////////////////////////////////////////////////////////////////
 
         	    /*
         		* If the vector of mapped reads is empty, then the individual does
@@ -873,430 +918,265 @@ void Polly(int region_size, std::vector<std::string> desired_scaffolds, double S
         		*/
         		if (mapped_reads.empty()){
         			continue;
-        		}
-
-        		/*
-        		* Genotype each read, adding to the INDIVIDUAL's genotype
-        		* table.
-        		*/
-        		for(unsigned int i = 0; i < mapped_reads.size(); i++){
-        			/*
-        			* Set the first locus of the microsat equal to the the point
-        			* at which the first motif SHOULD occur if the current sam
-        			* sequence has a motif.
-        			* Some microsat loci are present, but don't begin at exactly
-        			* the same locus as the reference microsat. So, you want to
-        			* also check the loci -/+2 bp from the known microsat locus
-        			* to see if the microsat starts there.
-        			*/
-        			sam_bp = std::__cxx11::stoi(lookup_table[row][0]) - std::__cxx11::stoi(mapped_reads[i][0]);
-        			/*
-        			* Set the first base pair in the motif equal to 0 so you can
-        			* check if the motif is found in the current sam sequence.
-        			*/
-        			motif_bp = 0;
-        			/*
-        			* Check if the current read has a microsatellite starting
-        			* anywhere within 5bp of the microsat locus indicated in
-        			* the lookup table.
-        			*/
-        			for(int pos = 0; pos < 5; pos++){
-        				if(mapped_reads[i][1][sam_bp] != lookup_table[row][2][motif_bp]){
-        					sam_bp++;
-        					continue;
-        				}else if(mapped_reads[i][1][sam_bp] == lookup_table[row][2][motif_bp]){
-        					/*
-        					* Begin counting the number of base pairs which are
-        					* identical between the lookup motif and the current
-        					* sam sequence.
-        					*/
-        					while(sam_bp < (mapped_reads[i][1].size() + 2)){
-        						/*
-        						* If the current number of identical base pairs
-        						* is less than the size of the motif and the
-        						* current motif and sam_bp match each other,
-        						* count this as an identical base pair and move
-        						* to the next base pair.
-        						*/
-        						if((ID_bp_counter < lookup_table[row][2].size()) && ((mapped_reads[i][1][sam_bp] == lookup_table[row][2][motif_bp]))){
-        							ID_bp_counter++;
-        							motif_bp++;
-        							sam_bp++;
-        							continue;
-        						/*
-        						* If a full motif is detected, increment the
-        						* count of repeats by one and start at the
-        						* beginning of the motif to see if there are any
-        						* other repeats in the current sequence.
-        						*/
-        						}else if(ID_bp_counter == lookup_table[row][2].size()){
-        							repeats_count++;
-        							motif_bp = 0;
+        		}else{
+                    // EDIT: Delete before finalizing package
+                    running_loci_count++;
+    
+            		/*
+            		* Genotype each read, adding to the INDIVIDUAL's genotype
+            		* table.
+            		*/
+            		for(unsigned int i = 0; i < mapped_reads.size(); i++){
+            			/*
+            			* Set the first locus of the microsat equal to the the point
+            			* at which the first motif SHOULD occur if the current sam
+            			* sequence has a motif.
+            			* Some microsat loci are present, but don't begin at exactly
+            			* the same locus as the reference microsat. So, you want to
+            			* also check the loci -/+2 bp from the known microsat locus
+            			* to see if the microsat starts there.
+            			*/
+            			sam_bp = std::__cxx11::stoi(lookup_table[row][0]) - std::__cxx11::stoi(mapped_reads[i][0]);
+            			/*
+            			* Set the first base pair in the motif equal to 0 so you can
+            			* check if the motif is found in the current sam sequence.
+            			*/
+            			motif_bp = 0;
+            			/*
+            			* Check if the current read has a microsatellite starting
+            			* anywhere within 5bp of the microsat locus indicated in
+            			* the lookup table.
+            			*/
+            			for(int pos = 0; pos < 5; pos++){
+            				if(mapped_reads[i][1][sam_bp] != lookup_table[row][2][motif_bp]){
+            					sam_bp++;
+            					continue;
+            				}else if(mapped_reads[i][1][sam_bp] == lookup_table[row][2][motif_bp]){
+            					/*
+            					* Begin counting the number of base pairs which are
+            					* identical between the lookup motif and the current
+            					* sam sequence.
+            					*/
+            					while(sam_bp < (mapped_reads[i][1].size() + 2)){
+            						/*
+            						* If the current number of identical base pairs
+            						* is less than the size of the motif and the
+            						* current motif and sam_bp match each other,
+            						* count this as an identical base pair and move
+            						* to the next base pair.
+            						*/
+            						if((ID_bp_counter < lookup_table[row][2].size()) && ((mapped_reads[i][1][sam_bp] == lookup_table[row][2][motif_bp]))){
+            							ID_bp_counter++;
+            							motif_bp++;
+            							sam_bp++;
+            							continue;
+            						/*
+            						* If a full motif is detected, increment the
+            						* count of repeats by one and start at the
+            						* beginning of the motif to see if there are any
+            						* other repeats in the current sequence.
+            						*/
+            						}else if(ID_bp_counter == lookup_table[row][2].size()){
+            							repeats_count++;
+            							motif_bp = 0;
+            							ID_bp_counter = 0;
+            							continue;
+            						/*
+            						* If repeats have already been detected but the
+            						* current sam bp does not align with the
+            						* corresponding motif bp OR the read has ended,
+            						* the microsat has ended. Thus, you must break
+            						* out of JUST the current loop to add the genotype
+            						* information to the output 2D vector.
+            						*/
+            						}else if((repeats_count > 0) && ((mapped_reads[i][1][sam_bp] != lookup_table[row][2][motif_bp]) || (sam_bp > mapped_reads[i][1].length()))){
+            							motif_bp = 0;
+            							break;
+            						/*
+            						* If repeats have not been detected but the
+            						* current sam bp no longer aligns with the motif,
+            						* don't output the lookup row's information.
+            						* Simply skip to the next read, as this one
+            						* lacks a full motif.
+            						*/
+            						}else if((repeats_count == 0)&&((mapped_reads[i][1][sam_bp] != lookup_table[row][2][motif_bp]))){
+            							break_both = true;
+            							motif_bp = 0;
+            					    	ID_bp_counter = 0;
+            							break;
+            						}
+            					}
+            					/*
+            					* If the for loop was broken because the sam sequence
+            					* did not contain any repeats, move to the next base
+            					* pair in position.
+            					*/
+            					if(break_both){
+            						break_both = false;
+            						continue;
+            					}
+            					/*
+            					* Once you are finished genotyping a read, check if
+            					* it has been counted in this individual at this
+            					* locus before. If not, add a new entry to the
+            					* scratch genotypes and move to the next read in the
+            					* file.
+            					*/
+            					std::map<int, int>::iterator rep;
+            					rep = scratch_genotypes.find(repeats_count); // Map find searches only for KEYS, so you need not specify ->first
+            					if(rep == scratch_genotypes.end()){
+            						scratch_genotypes.insert(std::pair<int, int>(repeats_count,1));
+            						repeats_count = 0;
+            						sam_bp = 0;
+            						motif_bp = 0;
         							ID_bp_counter = 0;
-        							continue;
-        						/*
-        						* If repeats have already been detected but the
-        						* current sam bp does not align with the
-        						* corresponding motif bp OR the read has ended,
-        						* the microsat has ended. Thus, you must break
-        						* out of JUST the current loop to add the genotype
-        						* information to the output 2D vector.
-        						*/
-        						}else if((repeats_count > 0) && ((mapped_reads[i][1][sam_bp] != lookup_table[row][2][motif_bp]) || (sam_bp > mapped_reads[i][1].length()))){
-        							motif_bp = 0;
-        							break;
-        						/*
-        						* If repeats have not been detected but the
-        						* current sam bp no longer aligns with the motif,
-        						* don't output the lookup row's information.
-        						* Simply skip to the next read, as this one
-        						* lacks a full motif.
-        						*/
-        						}else if((repeats_count == 0)&&((mapped_reads[i][1][sam_bp] != lookup_table[row][2][motif_bp]))){
-        							break_both = true;
-        							motif_bp = 0;
-        					    	ID_bp_counter = 0;
-        							break;
-        						}
-        					}
-        					/*
-        					* If the for loop was broken because the sam sequence
-        					* did not contain any repeats, move to the next base
-        					* pair in position.
-        					*/
-        					if(break_both){
-        						break_both = false;
-        						continue;
-        					}
-        					/*
-        					* Once you are finished genotyping a read, check if
-        					* it has been counted in this individual at this
-        					* locus before. If not, add a new entry to the
-        					* scratch genotypes and move to the next read in the
-        					* file.
-        					*/
-        					std::map<int, int>::iterator rep;
-        					rep = scratch_genotypes.find(repeats_count); // Map find searches only for KEYS, so you need not specify ->first
-        					if(rep == scratch_genotypes.end()){
-        						scratch_genotypes.insert(std::pair<int, int>(repeats_count,1));
-        						repeats_count = 0;
-        						sam_bp = 0;
-        						motif_bp = 0;
-    							ID_bp_counter = 0;
-								break;
-    							/*
-        						* If the genotype of the current read HAS been
-        						* recorded previously, increment its count by one,
-        						* clear variables, and move to the next read.
-        						*/
-        						}else{
-        							scratch_genotypes.find(repeats_count)->second = scratch_genotypes.find(repeats_count)->second + 1;
-        							repeats_count = 0;
-        							sam_bp = 0;
-        							motif_bp = 0;
-        							ID_bp_counter = 0;
-        							break;
-        						}
-        						/*
-        						If the current sam read doesn't have a microsat motif at the indicated position, skip it.
-        						*/
-        					}else{
-        						continue;
-        					}
-        				continue;
-        			}
-        		}
-        		repeats_count = 0;
-        		sam_bp = 0;
-        		motif_bp = 0;
-        		ID_bp_counter = 0;
-        		/*
-        		Once you've genotyped every read (including SE reads) for the current locus of the current individual, identify the two alleles which were
-        		most common and output them in a single string as "allele1/allele2".
-        		*/
-        		// First, make sure reads were actually genotyped (it is possible that all reads for this locus had very low map quality scores)
-        		if(!scratch_genotypes.empty()){
-        			// Iterate through each member of the map and find the value of "second" which is largest
-        			std::map<int, int>::iterator variant;
-        			for(variant = scratch_genotypes.begin(); variant != scratch_genotypes.end(); variant++){
-        				current_variant = variant -> first;
-        				current_copies = variant -> second;
-        				if(current_copies > largest_copies){
-        					frequent_variant = current_variant;
-
-        					largest_copies = current_copies;
-        					continue;
-        				}else{
-        					continue;
-        				}
-        			}
-        			// Check if the current most frequent variant has 2x as many reads as any other variant.
-        			std::map<int, int>::iterator variant2;
-        			bool two_times_larger = true;
-        			for(variant2 = scratch_genotypes.begin(); variant2 != scratch_genotypes.end(); variant2++){
-        				current_variant = variant2 ->first;
-        				current_copies = variant2 ->second;
-        				// First, make sure the current number of repeats does not equal the most common number of repeats to ensure you don't count the most common variant's number of copies as NOT two times larger than it's own number of copies.
-        				if((current_variant != frequent_variant) && (largest_copies >= 2*current_copies)){
-        					continue;
-        				}else if((current_variant != frequent_variant) && (largest_copies < 2*current_copies)){
-        					two_times_larger = false;
-        					current_copies = 0;
-        					break;
-        				}
-        			}
-        			/*
-        			* Homozygous Conditions:
-        			* If the variant which appears on the greatest number of reads
-        			* has 2x as many reads as any other variant, assume the
-        			* individual has only ONE true genotype and is thus HOMOZYGOUS.
-        			* Output the genotype for this locus, record the allele count,
-        			* and move to the next locus.
-        			*/
-        			if(two_times_larger){
-
-        			    allele_pair = std::to_string(frequent_variant);
-        			    allele_pair.append("/");
-        			    allele_pair.append(std::to_string(frequent_variant));
-        				MicroOutput << chr << "," << lookup_locus << "," << lookup_table[row][2] << "," << allele_pair << std::endl;
-        				/*
-        				* First, build the allele identifier - a motif followed
-        				* by a number of repeats (for example, TT7)
-        				*/
-    					allele_identifier = lookup_table[row][2];
-    					allele_identifier.append(std::__cxx11::to_string(frequent_variant));
-
-    					// Next, create iterators for the locus map and the allele map
-    					std::map<std::string, std::map<std::string, int>>::iterator outer_iterator;
-                        std::map<std::string, int>::iterator inner_iterator;
-
-                        /*
-                        * If the map is not empty, check if the allele-to-be
-                        * -recorded has been "found" before.
-                        */
-                        for(outer_iterator = allele_counts.begin(); outer_iterator != allele_counts.end(); outer_iterator++){
-                            // If the current locus has been recorded before, check if the allele for this locus has been recorded as well
-                            if(outer_iterator->first == locus_identifier){
-    	                        locus_found = true;
-                                for(inner_iterator = outer_iterator->second.begin(); inner_iterator != outer_iterator->second.end(); inner_iterator++){
-                                    /*
-                                    If the current allele HAS been found before,
-                                    * increment its count by 2 to record the
-                                    * new homozygote
-                                    */
-                                    if(inner_iterator->first == allele_identifier){
-                                        inner_iterator->second = inner_iterator->second + 2;
-                                        allele_identifier.clear();
-                                        frequent_variant = 0;
-                        				two_times_larger = false;
-                        				scratch_genotypes.clear();
-                        				allele_found = true;
-                                        break;
-                                    }else{
-                                        continue;
-                                    }
-                                }
-                            // If the locus identifier has yet to be found but there still remains other rows, check those rows
-                            }else{
-                                locus_found = false;
-                                continue;
-                            }
-                            /*
-                            * If you have reached the last allele under the
-                            * current locus and have NOT found the allele,
-                            * add a new entry of the allele to the map and
-                            * stop searching.
-                            */
-                            if((outer_iterator->first == locus_identifier) && (!allele_found)){
-                                outer_iterator->second.insert(std::pair<std::string, int>(allele_identifier, 2));
-                                allele_identifier.clear();
-                                frequent_variant = 0;
-                        		two_times_larger = false;
-                        		scratch_genotypes.clear();
-                                break;
-                            }else if(allele_found){
-                                allele_found = false;
-								allele_identifier.clear();
-                                frequent_variant = 0;
-                        		two_times_larger = false;
-                        		scratch_genotypes.clear();
-                                break;
-                            }
-                        }
-                        // UNTESTED:
-                        // If the current locus was not found after iterating through every entry of allele_counts, add the current locus and allele as a new entry and move to the next locus
-                        if(!locus_found){
-                            std::map<std::string, int> temp_map{{allele_identifier,2}};
-                            allele_counts.insert(std::pair<std::string, std::map<std::string, int>>(locus_identifier, temp_map));
-                            frequent_variant = 0;
-                        	two_times_larger = false;
-                        	scratch_genotypes.clear();
-                            allele_identifier.clear();
-                            /*
-                			* Clean all relevant objects for the next locus.
-                			*/
-                			second_copies = 0;
-                			largest_copies = 0;
-                			current_copies = 0;
-                            continue;
-                        }else{
-                            locus_found = false;
-							/*
-                			* Clean all relevant objects for the next locus.
-                			*/
-                			second_copies = 0;
-                			largest_copies = 0;
-                			current_copies = 0;
-                            continue;
-                        }
-                        /*
-                		* Clean all relevant objects for the next locus.
-                		*/
-            			second_copies = 0;
-            			largest_copies = 0;
-            			current_copies = 0;
-                        continue;
-        			/*
-        			* Heterozygous Conditions:
-        			* If the allele with the greatest number of copies does NOT
-        			* have 2x as many copies as any other allele, find the allele
-        			* found in the second greatest number of reads and add both
-        			* to the output.
-        			*/
-        			}else{
-    					allele_identifier = lookup_table[row][2];
-    					allele_identifier.append(std::__cxx11::to_string(frequent_variant));
-    					std::map<std::string, std::map<std::string, int>>::iterator outer_iterator;
-                        std::map<std::string, int>::iterator inner_iterator;
-
-        				/*
-        				* Search the outer map until you find the current
-        				* locus. Check if the allele-to-be-recorded has been
-        				* "found" before.
-        				*/
-                        for(outer_iterator = allele_counts.begin(); outer_iterator != allele_counts.end(); outer_iterator++){
-                            if(outer_iterator->first == locus_identifier){
-                                locus_found = true;
-                                for(inner_iterator = outer_iterator->second.begin(); inner_iterator != outer_iterator->second.end(); inner_iterator++){
-                                    /*
-                                    * If the current allele HAS been found
-                                    * before, increment its count by 1 to
-                                    * record one of the heterozygote's alleles.
-                                    * Do NOT clear the objects, as you still
-                                    * must record the second most common allele
-                                    */
-                                    if(inner_iterator->first == allele_identifier){
-                                        inner_iterator->second = inner_iterator->second + 1;
-                                        allele_identifier.clear();
-                        				allele_found = true;
-                                        break;
-                                    }else{
-                                        continue;
-                                    }
-                                }
-                        // If the locus identifier has yet to be found but there still remains other rows, check those rows
-                            }else{
-                                locus_found = false;
-                                continue;
-                            }
-
-                        // If you have reached the last allele under the current locus and have NOT found the allele, add a new entry of the allele to the map and stop searching.
-                            if((outer_iterator->first == locus_identifier) && (!allele_found)){
-                                outer_iterator->second.insert(std::pair<std::string, int>(allele_identifier, 1));
-								allele_identifier.clear();
-                                break;
-                            }else if(allele_found){
-								allele_found = false;
-								allele_identifier.clear();
-								break;
-							}
-                        }
-                        // UNTESTED:
-                        // If the current locus was not found after iterating through every entry of allele_counts, add the current locus and allele as a new entry and move to the next locus
-                        if(!locus_found){
-                            std::map<std::string, int> temp_map{{allele_identifier,1}};
-                            allele_counts.insert(std::pair<std::string, std::map<std::string, int>>(locus_identifier, temp_map));
-                            allele_identifier.clear();
-                        }else{
-                            locus_found = false;
-                        }
-        				/*
-        				* Find the second most frequent variant in the individual's
-        				* reads for this locus
-        				*/
-        				std::map<int, int>::iterator variant3;
-        				for(variant3 = scratch_genotypes.begin(); variant3 != scratch_genotypes.end(); variant3++){
-        					current_variant = variant3 -> first;
-        					current_copies = variant3 -> second;
-        					if((current_variant != frequent_variant) && (current_copies <= largest_copies) && (current_copies >= second_copies)){
-        						second_variant = current_variant;
-        						second_copies = current_copies;
-        						continue;
-        						}else{
-        							continue;
-        						}
-        					}
-        				// If a second largest variant was found, output it as an official allele and move to the next locus.
-        				if(second_variant != 0){
-        				    allele_pair = std::to_string(frequent_variant);
+    								break;
+        							/*
+            						* If the genotype of the current read HAS been
+            						* recorded previously, increment its count by one,
+            						* clear variables, and move to the next read.
+            						*/
+            						}else{
+            							scratch_genotypes.find(repeats_count)->second = scratch_genotypes.find(repeats_count)->second + 1;
+            							repeats_count = 0;
+            							sam_bp = 0;
+            							motif_bp = 0;
+            							ID_bp_counter = 0;
+            							break;
+            						}
+            						/*
+            						If the current sam read doesn't have a microsat motif at the indicated position, skip it.
+            						*/
+            					}else{
+            						continue;
+            					}
+                				continue;
+                			}
+                		}
+            		repeats_count = 0;
+            		sam_bp = 0;
+            		motif_bp = 0;
+            		ID_bp_counter = 0;
+            		/*
+            		Once you've genotyped every read (including SE reads) for the current locus of the current individual, identify the two alleles which were
+            		most common and output them in a single string as "allele1/allele2".
+            		*/
+            		// First, make sure reads were actually genotyped (it is possible that all reads for this locus had very low map quality scores)
+            		if(!scratch_genotypes.empty()){
+            			// Iterate through each member of the map and find the value of "second" which is largest
+            			std::map<int, int>::iterator variant;
+            			for(variant = scratch_genotypes.begin(); variant != scratch_genotypes.end(); variant++){
+            				current_variant = variant -> first;
+            				current_copies = variant -> second;
+            				if(current_copies > largest_copies){
+            					frequent_variant = current_variant;
+    
+            					largest_copies = current_copies;
+            					continue;
+            				}else{
+            					continue;
+            				}
+            			}
+            			// Check if the current most frequent variant has 2x as many reads as any other variant.
+            			std::map<int, int>::iterator variant2;
+            			bool two_times_larger = true;
+            			for(variant2 = scratch_genotypes.begin(); variant2 != scratch_genotypes.end(); variant2++){
+            				current_variant = variant2 ->first;
+            				current_copies = variant2 ->second;
+            				// First, make sure the current number of repeats does not equal the most common number of repeats to ensure you don't count the most common variant's number of copies as NOT two times larger than it's own number of copies.
+            				if((current_variant != frequent_variant) && (largest_copies >= 2*current_copies)){
+            					continue;
+            				}else if((current_variant != frequent_variant) && (largest_copies < 2*current_copies)){
+            					two_times_larger = false;
+            					current_copies = 0;
+            					break;
+            				}
+            			}
+            			/*
+            			* Homozygous Conditions:
+            			* If the variant which appears on the greatest number of reads
+            			* has 2x as many reads as any other variant, assume the
+            			* individual has only ONE true genotype and is thus HOMOZYGOUS.
+            			* Output the genotype for this locus, record the allele count,
+            			* and move to the next locus.
+            			*/
+            			if(two_times_larger){
+    
+            			    allele_pair = std::to_string(frequent_variant);
             			    allele_pair.append("/");
-            			    allele_pair.append(std::to_string(second_variant));
-        					MicroOutput << chr << "," << lookup_locus << "," << lookup_table[row][2] << "," << allele_pair << std::endl;
-
-        					allele_identifier = lookup_table[row][2];
-    						allele_identifier.append(std::__cxx11::to_string(second_variant));
-    						std::map<std::string, std::map<std::string, int>>::iterator outer_iterator;
-                            std::map<std::string, int>::iterator inner_iterator;
-
+            			    allele_pair.append(std::to_string(frequent_variant));
+            				MicroOutput << chr << "," << lookup_locus << "," << lookup_table[row][2] << "," << allele_pair << std::endl;
             				/*
-            				* Search the outer map until you find the current
-            				* locus. Check if the allele-to-be-recorded has been
-            				* "found" before.
+            				* First, build the allele identifier - a motif followed
+            				* by a number of repeats (for example, TT7)
             				*/
+        					allele_identifier = lookup_table[row][2];
+        					allele_identifier.append(std::__cxx11::to_string(frequent_variant));
+    
+        					// Next, create iterators for the locus map and the allele map
+        					std::map<std::string, std::map<std::string, int>>::iterator outer_iterator;
+                            std::map<std::string, int>::iterator inner_iterator;
+    
+                            /*
+                            * If the map is not empty, check if the allele-to-be
+                            * -recorded has been "found" before.
+                            */
                             for(outer_iterator = allele_counts.begin(); outer_iterator != allele_counts.end(); outer_iterator++){
+                                // If the current locus has been recorded before, check if the allele for this locus has been recorded as well
                                 if(outer_iterator->first == locus_identifier){
-                                    locus_found = true;
+        	                        locus_found = true;
                                     for(inner_iterator = outer_iterator->second.begin(); inner_iterator != outer_iterator->second.end(); inner_iterator++){
                                         /*
-                                        * If the current allele HAS been found before,
-                                        * increment its count by 1 to record one
-                                        * of the heterozygote's alleles.
+                                        If the current allele HAS been found before,
+                                        * increment its count by 2 to record the
+                                        * new homozygote
                                         */
                                         if(inner_iterator->first == allele_identifier){
-                                            inner_iterator->second = inner_iterator->second + 1;
+                                            inner_iterator->second = inner_iterator->second + 2;
                                             allele_identifier.clear();
-                                            scratch_genotypes.clear();
+                                            frequent_variant = 0;
+                            				two_times_larger = false;
+                            				scratch_genotypes.clear();
                             				allele_found = true;
                                             break;
                                         }else{
                                             continue;
                                         }
                                     }
+                                // If the locus identifier has yet to be found but there still remains other rows, check those rows
                                 }else{
                                     locus_found = false;
                                     continue;
                                 }
-								// If you have reached the last allele under the current locus and have NOT found the allele, add a new entry of the allele to the map and stop searching.
-								if((outer_iterator->first == locus_identifier) && (!allele_found)){
-									outer_iterator->second.insert(std::pair<std::string, int>(allele_identifier, 1));
-									allele_identifier.clear();
-									frequent_variant = 0;
-									second_variant = 0;
-									break;
-								}else if(allele_found){
-									allele_found = false;
-									allele_identifier.clear();
-									frequent_variant = 0;
-									second_variant = 0;
-									break;
-								}
+                                /*
+                                * If you have reached the last allele under the
+                                * current locus and have NOT found the allele,
+                                * add a new entry of the allele to the map and
+                                * stop searching.
+                                */
+                                if((outer_iterator->first == locus_identifier) && (!allele_found)){
+                                    outer_iterator->second.insert(std::pair<std::string, int>(allele_identifier, 2));
+                                    allele_identifier.clear();
+                                    frequent_variant = 0;
+                            		two_times_larger = false;
+                            		scratch_genotypes.clear();
+                                    break;
+                                }else if(allele_found){
+                                    allele_found = false;
+    								allele_identifier.clear();
+                                    frequent_variant = 0;
+                            		two_times_larger = false;
+                            		scratch_genotypes.clear();
+                                    break;
+                                }
                             }
                             // UNTESTED:
                             // If the current locus was not found after iterating through every entry of allele_counts, add the current locus and allele as a new entry and move to the next locus
                             if(!locus_found){
-                                std::map<std::string, int> temp_map{{allele_identifier,1}};
+                                std::map<std::string, int> temp_map{{allele_identifier,2}};
                                 allele_counts.insert(std::pair<std::string, std::map<std::string, int>>(locus_identifier, temp_map));
-                                second_variant = 0;
+                                frequent_variant = 0;
+                            	two_times_larger = false;
                             	scratch_genotypes.clear();
                                 allele_identifier.clear();
                                 /*
@@ -1308,7 +1188,7 @@ void Polly(int region_size, std::vector<std::string> desired_scaffolds, double S
                                 continue;
                             }else{
                                 locus_found = false;
-								/*
+    							/*
                     			* Clean all relevant objects for the next locus.
                     			*/
                     			second_copies = 0;
@@ -1316,18 +1196,186 @@ void Polly(int region_size, std::vector<std::string> desired_scaffolds, double S
                     			current_copies = 0;
                                 continue;
                             }
-        					/*
+                            /*
                     		* Clean all relevant objects for the next locus.
                     		*/
-                    		second_copies = 0;
-                    		largest_copies = 0;
-                    		current_copies = 0;
+                			second_copies = 0;
+                			largest_copies = 0;
+                			current_copies = 0;
                             continue;
-        				}
-        			}
-        		// If the map quality of ALL reads in this individual were too low to be genotyped, skip to the next locus
-        		}else{
-        			continue;
+            			/*
+            			* Heterozygous Conditions:
+            			* If the allele with the greatest number of copies does NOT
+            			* have 2x as many copies as any other allele, find the allele
+            			* found in the second greatest number of reads and add both
+            			* to the output.
+            			*/
+            			}else{
+        					allele_identifier = lookup_table[row][2];
+        					allele_identifier.append(std::__cxx11::to_string(frequent_variant));
+        					std::map<std::string, std::map<std::string, int>>::iterator outer_iterator;
+                            std::map<std::string, int>::iterator inner_iterator;
+    
+            				/*
+            				* Search the outer map until you find the current
+            				* locus. Check if the allele-to-be-recorded has been
+            				* "found" before.
+            				*/
+                            for(outer_iterator = allele_counts.begin(); outer_iterator != allele_counts.end(); outer_iterator++){
+                                if(outer_iterator->first == locus_identifier){
+                                    locus_found = true;
+                                    for(inner_iterator = outer_iterator->second.begin(); inner_iterator != outer_iterator->second.end(); inner_iterator++){
+                                        /*
+                                        * If the current allele HAS been found
+                                        * before, increment its count by 1 to
+                                        * record one of the heterozygote's alleles.
+                                        * Do NOT clear the objects, as you still
+                                        * must record the second most common allele
+                                        */
+                                        if(inner_iterator->first == allele_identifier){
+                                            inner_iterator->second = inner_iterator->second + 1;
+                                            allele_identifier.clear();
+                            				allele_found = true;
+                                            break;
+                                        }else{
+                                            continue;
+                                        }
+                                    }
+                            // If the locus identifier has yet to be found but there still remains other rows, check those rows
+                                }else{
+                                    locus_found = false;
+                                    continue;
+                                }
+    
+                            // If you have reached the last allele under the current locus and have NOT found the allele, add a new entry of the allele to the map and stop searching.
+                                if((outer_iterator->first == locus_identifier) && (!allele_found)){
+                                    outer_iterator->second.insert(std::pair<std::string, int>(allele_identifier, 1));
+    								allele_identifier.clear();
+                                    break;
+                                }else if(allele_found){
+    								allele_found = false;
+    								allele_identifier.clear();
+    								break;
+    							}
+                            }
+                            // UNTESTED:
+                            // If the current locus was not found after iterating through every entry of allele_counts, add the current locus and allele as a new entry and move to the next locus
+                            if(!locus_found){
+                                std::map<std::string, int> temp_map{{allele_identifier,1}};
+                                allele_counts.insert(std::pair<std::string, std::map<std::string, int>>(locus_identifier, temp_map));
+                                allele_identifier.clear();
+                            }else{
+                                locus_found = false;
+                            }
+            				/*
+            				* Find the second most frequent variant in the individual's
+            				* reads for this locus
+            				*/
+            				std::map<int, int>::iterator variant3;
+            				for(variant3 = scratch_genotypes.begin(); variant3 != scratch_genotypes.end(); variant3++){
+            					current_variant = variant3 -> first;
+            					current_copies = variant3 -> second;
+            					if((current_variant != frequent_variant) && (current_copies <= largest_copies) && (current_copies >= second_copies)){
+            						second_variant = current_variant;
+            						second_copies = current_copies;
+            						continue;
+            						}else{
+            							continue;
+            						}
+            					}
+            				// If a second largest variant was found, output it as an official allele and move to the next locus.
+            				if(second_variant != 0){
+            				    allele_pair = std::to_string(frequent_variant);
+                			    allele_pair.append("/");
+                			    allele_pair.append(std::to_string(second_variant));
+            					MicroOutput << chr << "," << lookup_locus << "," << lookup_table[row][2] << "," << allele_pair << std::endl;
+    
+            					allele_identifier = lookup_table[row][2];
+        						allele_identifier.append(std::__cxx11::to_string(second_variant));
+        						std::map<std::string, std::map<std::string, int>>::iterator outer_iterator;
+                                std::map<std::string, int>::iterator inner_iterator;
+    
+                				/*
+                				* Search the outer map until you find the current
+                				* locus. Check if the allele-to-be-recorded has been
+                				* "found" before.
+                				*/
+                                for(outer_iterator = allele_counts.begin(); outer_iterator != allele_counts.end(); outer_iterator++){
+                                    if(outer_iterator->first == locus_identifier){
+                                        locus_found = true;
+                                        for(inner_iterator = outer_iterator->second.begin(); inner_iterator != outer_iterator->second.end(); inner_iterator++){
+                                            /*
+                                            * If the current allele HAS been found before,
+                                            * increment its count by 1 to record one
+                                            * of the heterozygote's alleles.
+                                            */
+                                            if(inner_iterator->first == allele_identifier){
+                                                inner_iterator->second = inner_iterator->second + 1;
+                                                allele_identifier.clear();
+                                                scratch_genotypes.clear();
+                                				allele_found = true;
+                                                break;
+                                            }else{
+                                                continue;
+                                            }
+                                        }
+                                    }else{
+                                        locus_found = false;
+                                        continue;
+                                    }
+    								// If you have reached the last allele under the current locus and have NOT found the allele, add a new entry of the allele to the map and stop searching.
+    								if((outer_iterator->first == locus_identifier) && (!allele_found)){
+    									outer_iterator->second.insert(std::pair<std::string, int>(allele_identifier, 1));
+    									allele_identifier.clear();
+    									frequent_variant = 0;
+    									second_variant = 0;
+    									break;
+    								}else if(allele_found){
+    									allele_found = false;
+    									allele_identifier.clear();
+    									frequent_variant = 0;
+    									second_variant = 0;
+    									break;
+    								}
+                                }
+                                // UNTESTED:
+                                // If the current locus was not found after iterating through every entry of allele_counts, add the current locus and allele as a new entry and move to the next locus
+                                if(!locus_found){
+                                    std::map<std::string, int> temp_map{{allele_identifier,1}};
+                                    allele_counts.insert(std::pair<std::string, std::map<std::string, int>>(locus_identifier, temp_map));
+                                    second_variant = 0;
+                                	scratch_genotypes.clear();
+                                    allele_identifier.clear();
+                                    /*
+                        			* Clean all relevant objects for the next locus.
+                        			*/
+                        			second_copies = 0;
+                        			largest_copies = 0;
+                        			current_copies = 0;
+                                    continue;
+                                }else{
+                                    locus_found = false;
+    								/*
+                        			* Clean all relevant objects for the next locus.
+                        			*/
+                        			second_copies = 0;
+                        			largest_copies = 0;
+                        			current_copies = 0;
+                                    continue;
+                                }
+            					/*
+                        		* Clean all relevant objects for the next locus.
+                        		*/
+                        		second_copies = 0;
+                        		largest_copies = 0;
+                        		current_copies = 0;
+                                continue;
+            				}
+            			}
+            		// If the map quality of ALL reads in this individual were too low to be genotyped, skip to the next locus
+            		}else{
+            			continue;
+            		}
         		}
     		/*
     		* If the current scaffold is not one of the desired scaffolds, skip
@@ -1337,7 +1385,13 @@ void Polly(int region_size, std::vector<std::string> desired_scaffolds, double S
         	    continue;
         	}
     	}
+    	bam_destroy1(b);
+        bam_hdr_destroy(header);
+        sam_close(bam_file);
     	MicroOutput.close();
+    	//EDIT: Remove before final product
+        RD_LOCI << "Total number of microsat loci found in " << ind_bam << ": " << running_loci_count << std::endl << "Total Read Depth of " << ind_bam << ": " << read_depth << std::endl;
+
     }
 
     // You now have a map with all alleles and the associated counts for each locus in the lookup table.

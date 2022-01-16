@@ -11,7 +11,7 @@
 #include <bits/stdc++.h>
 #include "htslib/sam.h"
 #include <Rcpp.h>
-#include "PollyR.h"
+#include "Polly.h"
 #include <sys/resource.h>
 #include <stdio.h>
 #include <errno.h>

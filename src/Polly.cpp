@@ -305,8 +305,11 @@ void MicroGenotyper(std::vector<std::string> bam_vec, std::string lookup_file, s
                * the same locus as the reference microsat. So, you want to
                * also check the loci -/+2 bp from the known microsat locus
                * to see if the microsat starts there.
+			   * HTSlib read indexing is lowered by 1, while you must search 2 bp prior to
+			   * start to account for search window, so subtract by 1 to get appropriate start
+			   * locus
                */
-              sam_bp = std::__cxx11::stoi(lookup_table[row][0]) - std::__cxx11::stoi(mapped_reads[i][0]);
+              sam_bp = std::__cxx11::stoi(lookup_table[row][0]) - std::__cxx11::stoi(mapped_reads[i][0]) - 1;
               /*
                * Set the first base pair in the motif equal to 0 so you can
                * check if the motif is found in the current sam sequence.

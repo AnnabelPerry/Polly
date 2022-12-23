@@ -1,0 +1,282 @@
+---
+title: "Polly Vignette"
+author: "Annabel Perry"
+output: html_document
+date: "2022-12-21"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+In this document are the steps required to run the Polly R Package on short 
+reads of your choice. For each of the below steps, we have provided an example
+of what the output should look like in `vignettes/example_outputs`
+
+Before running any of the code blocks below...
+
+*   Ensure you are in the `vignettes` working directory
+*   Extract the contents of `example_outputs`
+*   Ensure there are no invalid characters in your input files *[Footnote 1]*
+
+
+### I) Creating Lookup Table
+For Polly to genotype microsatellites in short-reads, it needs to know where to
+look for those microsatellites. In these steps, we show how to create a 
+lookup table of microsatellite start loci using a reference genome of your choice.
+
+
+Before running the following code block...
+
+*   Ensure that sequence names in the FASTA reference match those in your desired short read files *[Footnote 2]*
+*   Ensure that `tidyr`, `tibble`, `devtools`, and `micRocounter` are installed *[Footnote 3]*
+
+
+
+```{r lookup, eval=FALSE}
+library(tidyr)
+library(tibble)
+library(devtools)
+library(stringr)
+library(micRocounter)
+
+# Set R system locale to ensure all text is read as UTF-8 encoded
+Sys.setlocale( 'LC_ALL','C' )
+
+# Reads fasta file as a list of loci at which microsatellites occur
+dat <- ReadFasta(file = "reference_genome.fasta")
+# Remove the list entries summarizing the data
+dat <- list(dat$Twomers, dat$Threemers, dat$Fourmers, dat$Fivemers, dat$Sixmers)
+
+# Convert list to a dataframe
+indx <- sapply(dat, length)
+res <- as.data.frame(do.call(rbind,lapply(dat, 'length<-', max(indx))))
+colnames(res) <- names(dat[[which.max(indx)]])
+
+# this converts each of the titles from lists to characters
+res$Loci <- vapply(res$Loci, paste, collapse = ", ", character(1L))
+res$Lengths <- vapply(res$Lengths, paste, collapse = ", ", character(1L))
+res$Sequence <- vapply(res$Sequence, paste, collapse = ", ", character(1L))
+res$SequenceNames <- vapply(res$SequenceNames, paste, collapse = ", ", character(1L))
+
+# splits columns of data frame by commas
+tib <- tibble(res)
+tib_gen <- separate_rows(tib, "Loci", "Lengths", "Sequence", "SequenceNames", sep = ", ", convert = TRUE)
+
+# Convert motifs and sequence names back to upper case and remove the tilde
+# introduced to sequence names in previous steps
+tib_gen$Sequence <- toupper(tib_gen$Sequence)
+tib_gen$SequenceNames <- toupper(tib_gen$SequenceNames)
+tib_gen$SequenceNames <- vapply(tib_gen$SequenceNames, str_replace, vector(mode = "character", length = 1), "~", "")
+
+# writes output as a .csv
+write.csv(tib_gen, file = "Lookup Table.csv", row.names = F)
+```
+*We have included an example `Lookup Table.csv` so the user can know what to expect this file to look like, but note that we have removed many lines to save storage space. Thus, subsequent steps cannot be performed on this example file*
+
+
+
+### II) Preparing Reference Genome
+Before you align Illumina reads to a reference genome, you must index the 
+reference genome using the Burrows-Wheeler Alignment algorithm. To use the
+Genome Analysis ToolKit (GATK), you must generate `.fai` and `.dict` files for
+your reference genome
+
+Before running the following code block in Ubuntu... 
+
+*   Ensure BWA is loaded. We tested on version 0.7.17, compiled using GCC 8.3.0. Loading instructions will vary based on your machine's setup; see (Manual reference pages - BWA, 2022) in references
+*   Ensure SAMtools is loaded. We tested on version 1.10, compiled using GCC 9.3.0. Loading instructions will vary based on your machine's setup; see (SAMTools Manual Page, 2022) in references
+*   Ensure GATK is loaded. We tested on version 4.1.5.0, compiled using GCCcore 9.3.0 with Java 11. Loading instructions will vary based on your machine's setup; see (Broadinstitute/GATK, 2022) in references
+
+
+```{eval=FALSE}
+bwa index reference_genome.fasta
+
+samtools faidx reference_genome.fasta
+
+gatk CreateSequenceDictionary -R reference_genome.fasta
+
+```
+*Note: To prevent this vignette from taking up excess space, we have not included and example reference genome output. After this step, you should have 7 new files, each starting with the same name as your `reference_genome` but with the following suffixes: `.dict`, `.fasta.amb`, `.fasta.ann`, `.fasta.bwt`, `.fasta.fai`, `.fasta.pac`, `.fasta.sa`, *
+
+
+
+
+
+### III) Mapping Short Reads to Reference
+The following code block aligns a set of paired-end short reads to a reference genome.
+
+Before running the following code block in Ubuntu... 
+
+*   Ensure BWA is loaded. We tested on version 0.7.17, compiled using GCC 8.3.0. Loading instructions will vary based on your machine's setup; see (Manual reference pages - BWA, 2022) in references
+*   Optional: Replace BioSample, LibraryName, etc. with text descriptive of your sample
+
+```{eval=FALSE}
+bwa mem -M -R '@RG\tID:BioSample.LibraryName\tSM:BioSample\tLB:LibraryName\tPU:SingleFlowcell.SingleLane\tPL:ILLUMINA\t' reference_genome.fasta SRR[number]_1.fasta SRR[number]_2.fasta > SRR[number].sam  
+
+``` 
+*We have included an example output of `SRR[number]sam`, so the user can know what to expect this file to look like, but note that we have removed many lines to save storage space. Thus, subsequent steps cannot be performed on this example file*
+
+
+
+### IV) Preparing BAM Files
+
+The following code block shows the steps required to convert short read files
+of your choice to BAM format.
+
+Before running the following code block in Ubuntu... 
+
+*   Ensure Picard is loaded. We tested on version 2.21.6. Loading instructions will vary based on your machine's setup; see (Picard Tools Manual Page, 2022) in references
+*   Ensure SAMtools is loaded. We tested on version 1.10, compiled using GCC 9.3.0. Loading instructions will vary based on your machine's setup; see (SAMTools Manual Page, 2022) in references
+*   Ensure GATK is loaded. We tested on version 4.1.5.0, compiled using GCCcore 9.3.0 with Java 11. Loading instructions will vary based on your machine's setup; see (Broadinstitute/GATK, 2022) in references
+*   Replace all instances of `[number]` with the number of your actual short read file
+
+```{eval=FALSE}
+java -jar $EBROOTPICARD/picard.jar SortSam I=SRR[number].sam O=sorted_SRR[number].sam CREATE_INDEX=true SORT_ORDER=coordinate TMP_DIR=$TMPDIR   
+
+gatk LeftAlignIndels -R reference_genome.fasta -I sorted_SRR[number].sam -O Polly_SRR[number].sam 
+
+samtools view -S -b Polly_SRR[number].sam > Polly_SRR[number].bam 
+
+samtools index Polly_SRR[number].bam
+
+```
+*At the end of this step you should have two files ending in `.bam` and `.bam.bai`. We have included examples of both*
+
+
+
+### V) Preparing SNP Frequency Files
+To find polymorphic SNPs, PollySI needs a file containing the frequencies of 
+all SNPs. This code block creates a pileup of all your BAM files (if you have
+more than 1 BAM file, replace `Polly_SRR[number].bam` in the first line of the below
+code block with the name of a text file listing each BAM file on a separate line)
+
+Prior to running this code block in Ubuntu... 
+*   Ensure BCFtools is loaded. Loading instructions will vary based on your machine's setup; see (BCFtools - Genome Analysis, 2022) in references.
+*   Ensure VCFtools is loaded. Loading instructions will vary based on your machine's setup; see (VCFtools, 2022) in references.
+
+```{eval=FALSE}
+bcftools mpileup -O b -o output1.bcf -f reference_genome.fasta Polly_SRR[number].bam
+
+bcftools call -m -v -o output2.vcf output1.bcf 
+
+vcftools --vcf output2.vcf --freq --out Frequency_example
+
+```
+*See `Frequency_example.frq` and `Frequency_example.log` for examples of how the output should look, but note that we have removed many lines from `Frequency_example.frq` to save storage space. Thus, subsequent steps cannot be performed on this example file*
+
+
+
+### VI) Running Polly
+
+The following code blocks show examples of how to run each of the 5 Polly functions.
+```{r Polly, eval=FALSE}
+library(Polly)
+
+
+scaffolds <- c(
+  # Names of your desired scaffolds here
+)
+
+# Find all polymorphic SNPs, defining polymorphic SNPs as those where the minor allele
+# has a frequency of at least 0.5
+polymorphic_snps <- PollySI(freq_name = "SNPFrequency.frq", 
+                            desired_scaffolds = scaffolds, 
+                            threshold = 0.5)
+
+write.csv(polymorphic_snps, "PolymorphicSNPs.csv", row.names = F)
+
+# Genotype microsatellites in one individual. To run on multiple individuals,
+# add elements corresponding to those individuals in both the 'bam_vec' and
+# 'output_names' vectors. Note that this function will also output an "RD_LociCount.txt"
+# file describing the read depth and microsatellite locus counts of the inputs.
+MicroGenotyper(bam_vec = c("Polly_SRR[number].bam"), 
+               lookup_file = "Lookup Table.csv",but note that we have removed many lines from `Frequency_example.frq` to save storage space. Thus, subsequent steps cannot be performed on this example file*
+               desired_scaffolds = scaffolds,
+               output_names = c("MicroGenotyper_example.csv"))
+
+# Identify polymorphic microsatellites. For the purposes of this examples, we 
+# have defined polymorphic microsatellites as those which have >= 2 alleles in 
+# the sample, but for real analyses this threshold would need to be raised
+PollyMicros(CSV_names = c("MicroGenotyper_example.csv"), 
+            desired_scaffolds = scaffolds, 
+            threshold = 2, 
+            output_name = "PollyMicros_example.csv")
+
+# Identify 100bp (adjustable) clusters of polymorphic regions
+Polly(region_size = 100, 
+      desired_scaffolds = scaffolds, 
+      PollySIInputName = "PollySI_example.csv", 
+      PollyMicrosInputName = "PollyMicros_example.csv", 
+      FinalOutputName = "Polly_example.csv")
+
+# Convert 
+PollyPop(MicroGenotyperInputNames = c("MicroGenotyper_example.csv"), 
+         PollyMicrosInputNames = "PollyMicros_example.csv", 
+         output_name = "GenePop_example.txt", 
+         GenePop_header = "Enter your GenePop header here")
+
+```
+*We have included example outputs for each of these 5 functions so that the user can know what they are supposed to look like, but note that we have removed many lines from all to save storage space. Thus, subsequent steps cannot be performed on these example files*
+
+
+
+## Footnotes
+*[1]*
+
+Some characters, such as commas (","), semicolons (";"), colons (":"), and equals
+signs ("=") will crash one or more steps in the pipeline. These characters
+can be replaced with underscores ("_") in your file by running the following 
+command in an Ubuntu terminal routed to the working directory:
+
+To replace commas:
+`sed -i 's/,/_/g' your_file`
+
+To replace equals signs:
+`sed -i 's/=/_/g' your_file`
+
+To replace colons:
+`sed -i 's/:/_/g' your_file`
+
+To replace semicolons:
+`sed -i 's/;/_/g' your_file`
+
+... etc...
+
+
+
+
+
+*[2]*
+
+Check that your reference genome has sequence names consistent in format with 
+those found in the test SAM file. To do this, run the following code and check:
+
+```
+# Check the sequence names in a SAM file containing short reads and FASTA reference
+head Polly_SRR[number].sam
+grep '>' reference_genome.fasta
+```
+
+*[3]*
+
+`micRocounter` can be installed using the following `devtools`command in R: 
+
+````
+library(devtools)
+`install_github('johnathanlo/micRocounter')
+``
+
+
+### References
+*Manual reference pages - BWA. bwa. (n.d.). Retrieved December 22, 2022, from https://bio-bwa.sourceforge.net/bwa.shtml*
+
+*SAMTools Manual Page. samtools – Utilities for the Sequence Alignment/Map (SAM) format. (n.d.). Retrieved December 22, 2022, from http://www.htslib.org/doc/samtools.html*
+
+*Broad Institute. (n.d.). Broadinstitute/GATK: Official code repository for GATK versions 4 and up. the Genome Analysis ToolKit. Retrieved December 22, 2022, from https://github.com/broadinstitute/gatk#downloading*
+
+*Broad Institute. (n.d.). Picard Tools Manual Page. Picard Tools - By Broad Institute. Retrieved December 22, 2022, from https://broadinstitute.github.io/picard/ *
+
+*Cho, W. (n.d.). BCFtools - Genome Analysis. Retrieved December 22, 2022, from https://plink.readthedocs.io/en/latest/bcftools_mani/ *
+
+*VCFtools. (n.d.). Retrieved December 22, 2022, from https://vcftools.github.io/index.html *

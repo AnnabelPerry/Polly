@@ -1,0 +1,6 @@
+HTS_CFLAGS = 
+HTS_LIBS = -lhts
+
+
+PKG_CPPFLAGS = $(HTS_CFLAGS)
+PKG_LIBS = $(HTS_LIBS) 
